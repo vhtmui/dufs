@@ -10,6 +10,7 @@ use crate::Args;
 
 use anyhow::{anyhow, Result};
 use async_zip::{tokio::write::ZipFileWriter, Compression, ZipDateTime, ZipEntryBuilder};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 use bytes::Bytes;
 use chrono::{LocalResult, TimeZone, Utc};
 use futures_util::{pin_mut, TryStreamExt};
@@ -199,7 +200,16 @@ impl Server {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
 
-        if method.as_str() == "WRITEABLE" {
+        if method.as_str() == "CHECKAUTH" {
+            match user.clone() {
+                Some(user) => {
+                    *res.body_mut() = body_full(user);
+                }
+                None => self.auth_reject(&mut res)?,
+            }
+            return Ok(res);
+        } else if method.as_str() == "LOGOUT" {
+            self.auth_reject(&mut res)?;
             return Ok(res);
         }
 
@@ -250,7 +260,7 @@ impl Server {
             Method::GET | Method::HEAD => {
                 if is_dir {
                     if render_try_index {
-                        if allow_archive && query_params.contains_key("zip") {
+                        if allow_archive && has_query_flag(&query_params, "zip") {
                             if !allow_archive {
                                 status_not_found(&mut res);
                                 return Ok(res);
@@ -290,7 +300,7 @@ impl Server {
                             &mut res,
                         )
                         .await?;
-                    } else if query_params.contains_key("zip") {
+                    } else if has_query_flag(&query_params, "zip") {
                         if !allow_archive {
                             status_not_found(&mut res);
                             return Ok(res);
@@ -320,13 +330,13 @@ impl Server {
                         .await?;
                     }
                 } else if is_file {
-                    if query_params.contains_key("edit") {
+                    if has_query_flag(&query_params, "edit") {
                         self.handle_edit_file(path, DataKind::Edit, head_only, user, &mut res)
                             .await?;
-                    } else if query_params.contains_key("view") {
+                    } else if has_query_flag(&query_params, "view") {
                         self.handle_edit_file(path, DataKind::View, head_only, user, &mut res)
                             .await?;
-                    } else if query_params.contains_key("hash") {
+                    } else if has_query_flag(&query_params, "hash") {
                         self.handle_hash_file(path, head_only, &mut res).await?;
                     } else {
                         self.handle_send_file(path, headers, head_only, &mut res)
@@ -672,7 +682,7 @@ impl Server {
                 error!("Failed to zip {}, {}", path.display(), e);
             }
         });
-        let reader_stream = ReaderStream::new(reader);
+        let reader_stream = ReaderStream::with_capacity(reader, BUF_SIZE);
         let stream_body = StreamBody::new(
             reader_stream
                 .map_ok(Frame::data)
@@ -889,7 +899,7 @@ impl Server {
                 return Ok(());
             }
 
-            let reader_stream = ReaderStream::new(file);
+            let reader_stream = ReaderStream::with_capacity(file, BUF_SIZE);
             let stream_body = StreamBody::new(
                 reader_stream
                     .map_ok(Frame::data)
@@ -931,13 +941,14 @@ impl Server {
         };
         res.headers_mut()
             .typed_insert(ContentType::from(mime_guess::mime::TEXT_HTML_UTF_8));
+        let index_data = STANDARD.encode(serde_json::to_string(&data)?);
         let output = self
             .html
             .replace(
                 "__ASSETS_PREFIX__",
                 &format!("{}{}", self.args.uri_prefix, self.assets_prefix),
             )
-            .replace("__INDEX_DATA__", &serde_json::to_string(&data)?);
+            .replace("__INDEX_DATA__", &index_data);
         res.headers_mut()
             .typed_insert(ContentLength(output.as_bytes().len() as u64));
         if head_only {
@@ -1132,7 +1143,7 @@ impl Server {
         } else {
             paths.sort_by(|v1, v2| v1.sort_by_name(v2))
         }
-        if query_params.contains_key("simple") {
+        if has_query_flag(query_params, "simple") {
             let output = paths
                 .into_iter()
                 .map(|v| {
@@ -1172,19 +1183,21 @@ impl Server {
             user,
             paths,
         };
-        let output = if query_params.contains_key("json") {
+        let output = if has_query_flag(query_params, "json") {
             res.headers_mut()
                 .typed_insert(ContentType::from(mime_guess::mime::APPLICATION_JSON));
             serde_json::to_string_pretty(&data)?
         } else {
             res.headers_mut()
                 .typed_insert(ContentType::from(mime_guess::mime::TEXT_HTML_UTF_8));
+
+            let index_data = STANDARD.encode(serde_json::to_string(&data)?);
             self.html
                 .replace(
                     "__ASSETS_PREFIX__",
                     &format!("{}{}", self.args.uri_prefix, self.assets_prefix),
                 )
-                .replace("__INDEX_DATA__", &serde_json::to_string(&data)?)
+                .replace("__INDEX_DATA__", &index_data)
         };
         res.headers_mut()
             .typed_insert(ContentLength(output.as_bytes().len() as u64));
@@ -1350,8 +1363,15 @@ impl Server {
         };
         let mtime = to_timestamp(&meta.modified()?);
         let size = match path_type {
-            PathType::Dir | PathType::SymlinkDir => None,
-            PathType::File | PathType::SymlinkFile => Some(meta.len()),
+            PathType::Dir | PathType::SymlinkDir => {
+                let mut count = 0;
+                let mut entries = tokio::fs::read_dir(&path).await?;
+                while entries.next_entry().await?.is_some() {
+                    count += 1;
+                }
+                count
+            }
+            PathType::File | PathType::SymlinkFile => meta.len(),
         };
         let rel_path = path.strip_prefix(base_path)?;
         let name = normalize_path(rel_path);
@@ -1403,7 +1423,7 @@ struct PathItem {
     path_type: PathType,
     name: String,
     mtime: u64,
-    size: Option<u64>,
+    size: u64,
 }
 
 impl PathItem {
@@ -1437,21 +1457,18 @@ impl PathItem {
             ),
             PathType::File | PathType::SymlinkFile => format!(
                 r#"<D:response>
-<D:href>{}</D:href>
+<D:href>{href}</D:href>
 <D:propstat>
 <D:prop>
-<D:displayname>{}</D:displayname>
+<D:displayname>{displayname}</D:displayname>
 <D:getcontentlength>{}</D:getcontentlength>
-<D:getlastmodified>{}</D:getlastmodified>
+<D:getlastmodified>{mtime}</D:getlastmodified>
 <D:resourcetype></D:resourcetype>
 </D:prop>
 <D:status>HTTP/1.1 200 OK</D:status>
 </D:propstat>
 </D:response>"#,
-                href,
-                displayname,
-                self.size.unwrap_or_default(),
-                mtime
+                self.size
             ),
         }
     }
@@ -1478,16 +1495,7 @@ impl PathItem {
 
     pub fn sort_by_size(&self, other: &Self) -> Ordering {
         match self.path_type.cmp(&other.path_type) {
-            Ordering::Equal => {
-                if self.is_dir() {
-                    alphanumeric_sort::compare_str(
-                        self.name.to_lowercase(),
-                        other.name.to_lowercase(),
-                    )
-                } else {
-                    self.size.unwrap_or(0).cmp(&other.size.unwrap_or(0))
-                }
-            }
+            Ordering::Equal => self.size.cmp(&other.size),
             v => v,
         }
     }
@@ -1715,12 +1723,12 @@ fn is_hidden(hidden: &[String], file_name: &str, is_dir_type: bool) -> bool {
 fn set_webdav_headers(res: &mut Response) {
     res.headers_mut().insert(
         "Allow",
-        HeaderValue::from_static("GET,HEAD,PUT,OPTIONS,DELETE,PATCH,PROPFIND,COPY,MOVE"),
+        HeaderValue::from_static(
+            "GET,HEAD,PUT,OPTIONS,DELETE,PATCH,PROPFIND,COPY,MOVE,CHECKAUTH,LOGOUT",
+        ),
     );
-    res.headers_mut().insert(
-        "DAV",
-        HeaderValue::from_static("1, 2, 3, sabredav-partialupdate"),
-    );
+    res.headers_mut()
+        .insert("DAV", HeaderValue::from_static("1, 2, 3"));
 }
 
 async fn get_content_type(path: &Path) -> Result<String> {
@@ -1783,4 +1791,11 @@ async fn sha256_file(path: &Path) -> Result<String> {
 
     let result = hasher.finalize();
     Ok(format!("{:x}", result))
+}
+
+fn has_query_flag(query_params: &HashMap<String, String>, name: &str) -> bool {
+    query_params
+        .get(name)
+        .map(|v| v.is_empty())
+        .unwrap_or_default()
 }

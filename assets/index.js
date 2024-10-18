@@ -94,7 +94,11 @@ let $editor;
 /**
  * @type Element
  */
-let $userBtn;
+let $loginBtn;
+/**
+ * @type Element
+ */
+let $logoutBtn;
 /**
  * @type Element
  */
@@ -108,7 +112,7 @@ window.addEventListener("DOMContentLoaded", async () => {
     return;
   }
 
-  DATA = JSON.parse($indexData.innerHTML);
+  DATA = JSON.parse(decodeBase64($indexData.innerHTML));
   DIR_EMPTY_NOTE = PARAMS.q ? 'No results' : DATA.dir_exists ? 'Empty folder' : 'Folder will be created when a file is uploaded';
 
   await ready();
@@ -121,7 +125,8 @@ async function ready() {
   $uploadersTable = document.querySelector(".uploaders-table");
   $emptyFolder = document.querySelector(".empty-folder");
   $editor = document.querySelector(".editor");
-  $userBtn = document.querySelector(".user-btn");
+  $loginBtn = document.querySelector(".login-btn");
+  $logoutBtn = document.querySelector(".logout-btn");
   $userName = document.querySelector(".user-name");
 
   addBreadcrumb(DATA.href, DATA.uri_prefix);
@@ -472,6 +477,8 @@ function addPath(file, index) {
     ${actionDelete}
     ${actionEdit}
   </td>`;
+  
+  let sizeDisplay = isDir ? `${file.size} ${file.size === 1 ? "item" : "items"}` : formatSize(file.size).join(" ");
 
   $pathsTableBody.insertAdjacentHTML("beforeend", `
 <tr id="addPath${index}">
@@ -482,7 +489,7 @@ function addPath(file, index) {
     <a href="${url}" ${isDir ? "" : `target="_blank"`}>${encodedName}</a>
   </td>
   <td class="cell-mtime">${formatMtime(file.mtime)}</td>
-  <td class="cell-size">${formatSize(file.size).join(" ")}</td>
+  <td class="cell-size">${sizeDisplay}</td>
   ${actionCell}
 </tr>`);
 }
@@ -513,18 +520,16 @@ function setupDropzone() {
 
 async function setupAuth() {
   if (DATA.user) {
-    $userBtn.classList.remove("hidden");
+    $logoutBtn.classList.remove("hidden");
+    $logoutBtn.addEventListener("click", logout);
     $userName.textContent = DATA.user;
   } else {
-    const $loginBtn = document.querySelector(".login-btn");
     $loginBtn.classList.remove("hidden");
     $loginBtn.addEventListener("click", async () => {
       try {
         await checkAuth();
-        location.reload();
-      } catch (err) {
-        alert(err.message);
-      }
+      } catch {}
+      location.reload();
     });
   }
 }
@@ -603,9 +608,11 @@ async function setupEditorPage() {
       });
     });
 
-    const $saveBtn = document.querySelector(".save-btn");
-    $saveBtn.classList.remove("hidden");
-    $saveBtn.addEventListener("click", saveChange);
+    if (DATA.editable) {
+      const $saveBtn = document.querySelector(".save-btn");
+      $saveBtn.classList.remove("hidden");
+      $saveBtn.addEventListener("click", saveChange);
+    }
   } else if (DATA.kind == "View") {
     $editor.readonly = true;
   }
@@ -744,12 +751,23 @@ async function saveChange() {
 async function checkAuth() {
   if (!DATA.auth) return;
   const res = await fetch(baseUrl(), {
-    method: "WRITEABLE",
+    method: "CHECKAUTH",
   });
   await assertResOK(res);
-  document.querySelector(".login-btn").classList.add("hidden");
-  $userBtn.classList.remove("hidden");
-  $userName.textContent = "";
+  $loginBtn.classList.add("hidden");
+  $logoutBtn.classList.remove("hidden");
+  $userName.textContent = await res.text();
+}
+
+function logout() {
+  if (!DATA.auth) return;
+  const url = baseUrl();
+  const xhr = new XMLHttpRequest();
+  xhr.open("LOGOUT", url, true, DATA.user);
+  xhr.onload = () => {
+    location.href = url;
+  }
+  xhr.send();
 }
 
 /**
@@ -909,4 +927,23 @@ function getEncoding(contentType) {
     }
   }
   return 'utf-8';
+}
+
+// Parsing base64 strings with Unicode characters
+function decodeBase64(base64String) {
+  const binString = atob(base64String);
+  const len = binString.length;
+  const bytes = new Uint8Array(len);
+  const arr = new Uint32Array(bytes.buffer, 0, Math.floor(len / 4));
+  let i = 0;
+  for (; i < arr.length; i++) {
+    arr[i] = binString.charCodeAt(i * 4) |
+             (binString.charCodeAt(i * 4 + 1) << 8) |
+             (binString.charCodeAt(i * 4 + 2) << 16) |
+             (binString.charCodeAt(i * 4 + 3) << 24);
+  }
+  for (i = i * 4; i < len; i++) {
+    bytes[i] = binString.charCodeAt(i);
+  }
+  return new TextDecoder().decode(bytes);
 }
