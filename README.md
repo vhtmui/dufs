@@ -216,8 +216,14 @@ dd skip=$upload_offset if=file status=none ibs=1 | \
   curl -X PATCH -H "X-Update-Range: append" --data-binary @- http://127.0.0.1:5000/file
 ```
 
+Health checks
+
+```sh
+curl http://127.0.0.1:5000/__dufs__/health
+```
+
 <details>
-<summary><h2>Advanced topics</h2></summary>
+<summary><h2>Advanced Topics</h2></summary>
 
 ### Access Control
 
@@ -244,16 +250,25 @@ dufs -a user:pass@/:rw,/dir1 -a @/
 
 DUFS supports the use of sha-512 hashed password.
 
-Create hashed password
+Create hashed password:
 
-```
-$ mkpasswd -m sha-512 123456
+```sh
+$ openssl passwd -6 123456 # or `mkpasswd -m sha-512 123456`
 $6$tWMB51u6Kb2ui3wd$5gVHP92V9kZcMwQeKTjyTRgySsYJu471Jb1I6iHQ8iZ6s07GgCIO69KcPBRuwPE5tDq05xMAzye0NxVKuJdYs/
 ```
 
-Use hashed password
-```
+Use hashed password:
+
+```sh
 dufs -a 'admin:$6$tWMB51u6Kb2ui3wd$5gVHP92V9kZcMwQeKTjyTRgySsYJu471Jb1I6iHQ8iZ6s07GgCIO69KcPBRuwPE5tDq05xMAzye0NxVKuJdYs/@/:rw'
+```
+> The hashed password contains `$6`, which can expand to a variable in some shells, so you have to use **single quotes** to wrap it.
+
+Or embed a command to dynamically generate a hashed password:
+
+```sh
+dufs -a admin:$(openssl passwd -6 123456)@/:rw
+dufs -a admin:$(mkpasswd -m sha-512 123456)@/:rw
 ```
 
 Two important things for hashed passwords:
@@ -394,6 +409,8 @@ Dufs allows users to customize the UI with your own assets.
 ```
 dufs --assets my-assets-dir/
 ```
+
+> If you only need to make slight adjustments to the current UI, you copy dufs's [assets](https://github.com/sigoden/dufs/tree/main/assets) directory and modify it accordingly. The current UI doesn't use any frameworks, just plain HTML/JS/CSS. As long as you have some basic knowledge of web development, it shouldn't be difficult to modify.
 
 Your assets folder must contains a `index.html` file.
 
